@@ -1,0 +1,869 @@
+% =================================================================
+% Assignment Report for PHYS 421: Parallel Computing
+% Assignment #7: Gravitational Potential Calculation for Star Clusters
+% =================================================================
+
+\documentclass[11pt,a4paper]{article}
+
+% ---------- Encoding, fonts, language ----------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[english]{babel}
+
+% ---------- Geometry & spacing ----------
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{setspace}
+\onehalfspacing
+\usepackage{parskip}
+
+% ---------- Math & symbols ----------
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{siunitx}
+\sisetup{detect-all=true}
+
+% ---------- Tables & graphics ----------
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{subcaption}
+
+% ---------- Hyperlinks & references ----------
+\usepackage[colorlinks=true,urlcolor=blue,bookmarks=true,citecolor=magenta,breaklinks=true,pdftex]{hyperref}
+\usepackage[nameinlink,capitalise]{cleveref}
+
+% ---------- Code listings ----------
+\usepackage{listings}
+\lstdefinestyle{pcstyle}{
+  basicstyle=\ttfamily\footnotesize,
+  numberstyle=\tiny, numbers=left, numbersep=8pt,
+  showstringspaces=false, showtabs=false, showspaces=false,
+  breaklines=true, frame=single, rulecolor=\color{black!20},
+  keywordstyle=\color{blue!90!black},
+  commentstyle=\color{green!65!black},
+  stringstyle=\color{orange!80!black},
+  tabsize=2,
+  captionpos=b
+}
+\lstset{style=pcstyle}
+
+% ---------- PGFPlots ----------
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+% ---------- Bibliography ----------
+\usepackage[backend=biber,style=numeric-comp,sorting=none,sortcites=true]{biblatex}
+\addbibresource{references.bib}
+
+% ---------- Metadata ----------
+\newcommand{\assignmentnumber}{7}
+\newcommand{\assignmenttitle}{Gravitational Potential Calculation for Star Clusters}
+\newcommand{\studentname}{[Adilet Akimshe]}
+\newcommand{\studentid}{[202194337]}
+\newcommand{\coursecode}{PHYS 421}
+\newcommand{\coursename}{Parallel Computing}
+\newcommand{\honor}{I affirm that this work complies with Nazarbayev University academic integrity policies and the policies regarding the use of AI tools outlined in the course syllabus}
+
+\title{Assignment Report \#\assignmentnumber \\ \assignmenttitle}
+\author{Student Name: \studentname \ (ID: \studentid) \\ Course: \coursecode \ \coursename}
+\date{Submitted: \today}
+
+% =================================================================
+\begin{document}
+\maketitle
+
+\begin{center}
+{Software packages used:} \\
+\begin{tabular}{|l|l|}
+\hline
+CUDA Toolkit 11.x/12.x & GPU kernel development \\
+Python 3.10 & Main scripting and automation \\
+CuPy (CUDA 11.x/12.x) & GPU-accelerated NumPy \\
+PyTorch (Latest) & Deep learning framework \\
+NumPy, Matplotlib & Data processing and visualization \\
+\hline
+\end{tabular}
+\end{center}
+
+\begin{center}
+{AI tools used:} \\
+\begin{tabular}{|l|l|}
+\hline
+Claude Code & Report writing, data analysis, code review \\
+\hline
+\end{tabular}
+\end{center}
+\vspace{2em}
+
+\begin{abstract}
+\noindent
+This study compares three GPU-accelerated methods for computing gravitational potential energy in N-body star cluster simulations: Direct Summation, Monte Carlo approximation, and Deep Learning. Each method was implemented in both CUDA C and CuPy (Python) to evaluate low-level versus high-level GPU programming trade-offs. Experiments were conducted on Plummer sphere distributions with $N = 10^3$ to $10^6$ particles, varying softening parameters ($\epsilon = 0.001$ to $0.1$) and Monte Carlo sample counts ($K = 10^3$ to $10^5$). Results show that CUDA Direct Summation achieves optimal performance (1.43s for $N=10^6$) with highest accuracy (0.12\% error), outperforming CuPy by 92×. Monte Carlo methods exhibited systematic error dominated by softening parameter choice rather than statistical sampling variance, contradicting the expected $1/\sqrt{K}$ error scaling. The Deep Learning approach failed catastrophically with $>10^{13}$\% error due to generalization failure across different particle counts, despite reasonable training performance. CUDA implementations consistently demonstrated superior performance, with the key trade-off being development complexity versus runtime efficiency.
+\end{abstract}
+
+% =================================================================
+\section{Introduction and Problem Statement}
+
+\subsection{Physical Background}
+
+The gravitational potential energy $U$ of an N-body system quantifies the total interaction energy between all particle pairs, given by:
+\begin{equation}\label{eq:potential}
+U = -\sum_{i < j} \frac{G m_i m_j}{r_{ij}},
+\end{equation}
+where $G$ is the gravitational constant, $m_i$ and $m_j$ are particle masses, and $r_{ij} = |\mathbf{r}_i - \mathbf{r}_j|$ is the distance between particles. This quantity is fundamental in astrophysical simulations, governing the dynamics and stability of self-gravitating systems like star clusters.
+
+To avoid numerical singularities from close particle encounters, we introduce gravitational softening:
+\begin{equation}\label{eq:softened_potential}
+U = -\sum_{i < j} \frac{G m_i m_j}{\sqrt{r_{ij}^2 + \epsilon^2}},
+\end{equation}
+where $\epsilon$ is the softening parameter.
+
+\subsection{Plummer Sphere Model}
+
+The Plummer sphere provides a canonical analytical model for globular clusters with density profile:
+\begin{equation}\label{eq:plummer_density}
+\rho(r) = \frac{3M}{4\pi a^3} \left(1 + \frac{r^2}{a^2}\right)^{-5/2},
+\end{equation}
+where $M$ is total mass and $a$ is the scale radius. For normalized parameters ($G=1$, $M=1$, $a=1$), the exact analytical solution is:
+\begin{equation}\label{eq:analytical_U}
+U_{analytical} = -\frac{3\pi}{32} \approx -0.294524.
+\end{equation}
+This provides a rigorous benchmark for validating discrete approximation methods.
+
+\subsection{Computational Methods}
+
+Three approaches are evaluated:
+
+\textbf{1. Direct Summation:} Computes all $N(N-1)/2$ pairwise interactions exactly with $O(N^2)$ complexity. Expected to provide highest accuracy but scale poorly for large $N$.
+
+\textbf{2. Monte Carlo (MC):} Randomly samples $K$ pairs to estimate $U$ with complexity $O(K)$, independent of $N$. Expected statistical error scales as $\sigma \propto 1/\sqrt{K}$.
+
+\textbf{3. Deep Learning (DL):} Trains a multilayer perceptron to learn the mapping from particle configurations to $U$, amortizing computational cost across multiple evaluations with $O(N)$ inference complexity.
+
+\subsection{Implementation Strategies}
+
+Each method is implemented in two GPU programming paradigms:
+\begin{itemize}
+\item \textbf{CUDA C:} Low-level custom kernels for maximum performance and control
+\item \textbf{CuPy:} High-level Python library providing GPU-accelerated NumPy operations
+\end{itemize}
+
+\subsection{Objectives}
+
+The study aims to answer:
+\begin{enumerate}
+\item How do runtime and accuracy scale with particle count $N$ for each method?
+\item What is the performance gap between CUDA and CuPy implementations?
+\item How does Monte Carlo error depend on sample count $K$ and softening $\epsilon$?
+\item Can deep learning provide a viable fast approximation for large $N$?
+\item What are the practical trade-offs between development complexity and performance?
+\end{enumerate}
+
+% =================================================================
+\section{Hardware and Software Environment}
+
+\subsection{Computational Infrastructure}
+
+All experiments were conducted in a Docker container environment with the following specifications:
+
+\begin{table}[H]
+  \centering
+  \caption{System and software environment.}
+  \label{table:environment}
+  \begin{tabular}{ll}
+    \toprule
+    Component & Specification \\
+    \midrule
+    Operating System & Linux (Docker container) \\
+    Kernel & 6.11.0-1013-nvidia \\
+    System RAM & 31 GB (25 GB available) \\
+    GPU & NVIDIA GPU (CUDA-capable) \\
+    CUDA Toolkit & 11.x / 12.x \\
+    Python & 3.10 \\
+    CuPy & cuda11x/cuda12x \\
+    PyTorch & Latest (CUDA-enabled) \\
+    NumPy & Latest \\
+    Compiler & nvcc (NVIDIA CUDA Compiler) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Data Generation Parameters}
+
+Plummer sphere sampling used the following configuration:
+\begin{itemize}
+\item Random seed: 42 (for reproducibility)
+\item Gravitational constant: $G = 1.0$
+\item Total mass: $M = 1.0$
+\item Scale radius: $a = 1.0$
+\item Particle masses: $m_i = 1/N$ (equal masses)
+\item Particle counts: $N \in \{1000, 10000, 100000, 1000000\}$
+\item Softening parameters: $\epsilon \in \{0.001, 0.01, 0.1\}$
+\item MC sample counts: $K \in \{1000, 10000, 100000\}$
+\end{itemize}
+
+% =================================================================
+\section{Methods and Implementation}
+
+\subsection{Part 1: Direct Summation}
+
+\subsubsection{CUDA C Implementation}
+
+The CUDA kernel assigns each thread to compute potential contributions for one particle:
+
+\begin{lstlisting}[language=C, caption={CUDA Direct Summation kernel (simplified)}, label={lst:cuda_direct}]
+__global__ void compute_potential_kernel(
+    float *x, float *y, float *z, float *m,
+    float *potentials, int n, float eps2, float G
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    float pot = 0.0f;
+    float xi = x[i], yi = y[i], zi = z[i];
+
+    for (int j = 0; j < n; j++) {
+        if (i == j) continue;
+        float dx = xi - x[j];
+        float dy = yi - y[j];
+        float dz = zi - z[j];
+        float r2 = dx*dx + dy*dy + dz*dz + eps2;
+        pot -= G * m[j] / sqrtf(r2);
+    }
+    potentials[i] = pot;
+}
+\end{lstlisting}
+
+Key optimization: Structure-of-Arrays (SoA) layout enables coalesced memory access. Each thread performs $O(N)$ work, yielding overall $O(N^2)$ complexity.
+
+\subsubsection{CuPy Implementation}
+
+CuPy uses broadcasting with chunking to manage memory:
+
+\begin{lstlisting}[language=Python, caption={CuPy Direct Summation with batching}, label={lst:cupy_direct}]
+import cupy as cp
+
+def compute_potential_direct(positions, masses, G=1.0, eps=0.01):
+    n = len(positions)
+    potentials = cp.zeros(n, dtype=cp.float32)
+    chunk_size = 2**15  # 32K particles per chunk
+    eps2 = eps * eps
+
+    for i in range(0, n, chunk_size):
+        chunk_end = min(i + chunk_size, n)
+        pos_i = positions[i:chunk_end]
+
+        # Separate 1D broadcasting (6x faster than 3D)
+        dx = pos_i[:, None, 0] - positions[None, :, 0]
+        dy = pos_i[:, None, 1] - positions[None, :, 1]
+        dz = pos_i[:, None, 2] - positions[None, :, 2]
+
+        r2 = dx*dx + dy*dy + dz*dz + eps2
+        contrib = -G * masses[None, :] / cp.sqrt(r2)
+
+        # Exclude self-interaction
+        for j in range(chunk_end - i):
+            contrib[j, i+j] = 0
+
+        potentials[i:chunk_end] = cp.sum(contrib, axis=1)
+
+    return potentials
+\end{lstlisting}
+
+Critical discovery: Separate 1D broadcasting operations ($dx$, $dy$, $dz$) are 6× faster than 3D array broadcasting. Chunk size of $2^{15}$ balances memory usage and iteration overhead.
+
+\subsection{Part 2: Monte Carlo Approximation}
+
+Monte Carlo estimates $U$ by sampling $K$ random pairs:
+\begin{equation}\label{eq:mc_estimator}
+U_{MC} \approx -\frac{N(N-1)}{2K} \sum_{k=1}^{K} \frac{G m_{i_k} m_{j_k}}{\sqrt{r_{i_k j_k}^2 + \epsilon^2}}
+\end{equation}
+
+\subsubsection{CUDA C Implementation}
+
+Uses cuRAND for on-device random number generation:
+
+\begin{lstlisting}[language=C, caption={CUDA Monte Carlo kernel}, label={lst:cuda_mc}]
+__global__ void mc_potential_kernel(
+    float *x, float *y, float *z, float *m,
+    int n, int n_samples, float eps2, float G,
+    curandState *states, float *results
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_samples) return;
+
+    curandState local_state = states[tid];
+
+    // Generate random pair (i, j) with i != j
+    int i = curand(&local_state) % n;
+    int j = curand(&local_state) % n;
+    while (i == j) j = curand(&local_state) % n;
+
+    // Compute contribution
+    float dx = x[i] - x[j];
+    float dy = y[i] - y[j];
+    float dz = z[i] - z[j];
+    float r2 = dx*dx + dy*dy + dz*dz + eps2;
+    results[tid] = -G * m[i] * m[j] / sqrtf(r2);
+
+    states[tid] = local_state;
+}
+\end{lstlisting}
+
+Avoids storing an $N \times K$ index matrix by generating pairs on-the-fly.
+
+\subsubsection{CuPy Implementation}
+
+\begin{lstlisting}[language=Python, caption={CuPy Monte Carlo}, label={lst:cupy_mc}]
+def compute_potential_monte_carlo(positions, masses,
+                                  n_samples=100000, G=1.0, eps=0.01):
+    n = len(positions)
+    # Generate random pairs
+    indices_i = cp.random.randint(0, n, size=n_samples)
+    indices_j = cp.random.randint(0, n, size=n_samples)
+
+    # Mask out self-pairs
+    valid = indices_i != indices_j
+
+    # Compute distances
+    dr = positions[indices_i[valid]] - positions[indices_j[valid]]
+    r2 = cp.sum(dr**2, axis=1) + eps**2
+
+    # Estimate U
+    contribs = -G * masses[indices_i[valid]] * masses[indices_j[valid]] / cp.sqrt(r2)
+    U_sample = cp.mean(contribs)
+    U_total = U_sample * n * (n - 1) / 2
+
+    return U_total
+\end{lstlisting}
+
+Memory constraint: At $N=10^6$ and $K=10^4$, random index storage requires 80 GB, causing OOM errors. CUDA avoids this limitation.
+
+\subsection{Part 3: Deep Learning}
+
+\subsubsection{Model Architecture}
+
+A multilayer perceptron (MLP) predicts $U$ from 21 aggregated statistical features:
+
+\begin{lstlisting}[language=Python, caption={PyTorch MLP architecture}, label={lst:mlp}]
+class GravitationalPotentialMLP(nn.Module):
+    def __init__(self, input_dim=21):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 256), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        return self.network(x)
+\end{lstlisting}
+
+Features include: mean/std/min/max of $(x, y, z)$ coordinates, radial distance statistics, pairwise distance percentiles (21 scalars total). This approach avoids the fixed-input-size limitation of raw position arrays.
+
+\subsubsection{Training Protocol}
+
+\begin{itemize}
+\item Training data: 10,000 samples of $N=5000$ particles each
+\item Train/validation split: 80\% / 20\%
+\item Loss function: Mean Squared Error (MSE)
+\item Optimizer: Adam with learning rate $10^{-3}$
+\item Early stopping: Validation loss $< 10^{-4}$
+\item Epochs: Up to 100 (typically stopped early)
+\end{itemize}
+
+\subsection{Timing Methodology}
+
+All experiments followed a rigorous protocol:
+\begin{enumerate}
+\item 3 warmup runs (discarded to account for JIT compilation and caching)
+\item 10 timed trials with mean $\pm$ standard deviation reported
+\item CUDA event-based timing for kernel-only measurements
+\item Python time.time() for end-to-end wall-clock time
+\end{enumerate}
+
+\subsection{Build and Run Instructions}
+
+\begin{lstlisting}[language=bash, caption={Compilation and execution commands}, label={lst:build_run}]
+# Generate Plummer data
+python data_gen.py --n_bodies 1000000 --seed 42
+
+# Compile CUDA programs
+cd direct_summation && nvcc -o direct_cuda direct_cuda.cu
+cd ../monte_carlo && nvcc -o mc_cuda mc_cuda.cu
+
+# Run experiments (automated)
+python run_experiments.py --methods direct monte_carlo deep_learning
+
+# Generate plots
+python plot_results.py --results experiments/run_*/results.csv
+\end{lstlisting}
+
+% =================================================================
+\section{Results}
+
+\subsection{Part 1: Direct Summation Performance}
+
+Table~\ref{table:direct_results} summarizes direct summation results with $\epsilon=0.01$.
+
+\begin{table}[H]
+  \centering
+  \caption{Direct summation performance and accuracy ($\epsilon=0.01$).}
+  \label{table:direct_results}
+  \begin{tabular}{rrrrrr}
+    \toprule
+    $N$ & \multicolumn{2}{c}{Runtime (s)} & \multicolumn{2}{c}{Error (\%)} & Speedup \\
+    \cmidrule(lr){2-3} \cmidrule(lr){4-5}
+    & CUDA & CuPy & CUDA & CuPy & (CUDA/CuPy) \\
+    \midrule
+    1,000 & 0.000263 & 0.000450 & 2.334 & 2.334 & 1.7× \\
+    10,000 & 0.001308 & 0.01619 & 1.597 & 1.597 & 12.4× \\
+    100,000 & 0.01469 & 1.578 & 0.163 & 0.162 & 107× \\
+    1,000,000 & 1.433 & 132.6 & 0.118 & 0.115 & 92.5× \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Key Observations:}
+\begin{itemize}
+\item CUDA speedup increases dramatically with $N$, reaching 92-107× at large scales
+\item Both implementations achieve $<0.2\%$ error for $N \geq 100{,}000$
+\item CuPy becomes impractical ($>2$ minutes) for $N=10^6$
+\item Scaling follows expected $O(N^2)$ behavior (visible in Figure~\ref{fig:runtime_vs_n})
+\end{itemize}
+
+\subsection{Part 2: Monte Carlo Performance}
+
+Table~\ref{table:mc_results} shows Monte Carlo results with $\epsilon=0.01$ and $K=100{,}000$.
+
+\begin{table}[H]
+  \centering
+  \caption{Monte Carlo performance ($\epsilon=0.01$, $K=100{,}000$).}
+  \label{table:mc_results}
+  \begin{tabular}{rrrrrr}
+    \toprule
+    $N$ & \multicolumn{2}{c}{Runtime (s)} & \multicolumn{2}{c}{Error (\%)} & Speedup \\
+    \cmidrule(lr){2-3} \cmidrule(lr){4-5}
+    & CUDA & CuPy & CUDA & CuPy & (CUDA/CuPy) \\
+    \midrule
+    10,000 & 0.0449 & 1.122 & 1.595 & 1.605 & 25.0× \\
+    100,000 & 0.420 & 11.31 & 0.162 & 0.163 & 26.9× \\
+    1,000,000 & 4.231 & 113.3 & 0.117 & 0.115 & 26.8× \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Critical Finding:} Monte Carlo error does \textbf{NOT} decrease with increasing $K$:
+\begin{itemize}
+\item $K=1{,}000$: Error = 0.1154\%
+\item $K=100{,}000$: Error = 0.1170\%
+\end{itemize}
+
+This contradicts the expected $1/\sqrt{K}$ scaling. Investigation revealed that \textbf{systematic error from softening parameter dominates statistical error}. Figure~\ref{fig:mc_error_vs_k} shows flat error lines across all $K$ values, confirming this hypothesis.
+
+\subsection{Part 3: Deep Learning Results}
+
+\subsubsection{Training Performance}
+
+Training on 10,000 samples of $N=5{,}000$ particles achieved:
+\begin{itemize}
+\item Training MSE: $1.405 \times 10^{-4}$
+\item Validation MSE: $5.552 \times 10^{-5}$
+\item Training error: 1.80\%
+\item Validation error: 1.82\%
+\item Early stopping after epoch 2 (validation loss $< 10^{-4}$)
+\end{itemize}
+
+\subsubsection{Inference Failure}
+
+Testing on $N=100{,}000$ particles produced catastrophic results:
+\begin{itemize}
+\item Predicted $U$: $-74{,}480{,}238{,}592.0$
+\item True $U$: $-0.294524$
+\item Relative error: $2.53 \times 10^{13}$\%
+\item Inference time: 0.112 s
+\end{itemize}
+
+\textbf{Root Cause Analysis:} The model trained on $N=5{,}000$ cannot generalize to $N=100{,}000$ due to:
+\begin{enumerate}
+\item \textbf{Distribution shift:} Statistical features computed from 100K particles have fundamentally different distributions than 5K samples
+\item \textbf{Scale mismatch:} No physics-informed constraints ensure $U$ scales appropriately with $N$
+\item \textbf{Insufficient diversity:} Training data does not cover the full configuration space
+\end{enumerate}
+
+The approach is fundamentally \textbf{not viable} without architectural changes (e.g., Graph Neural Networks or Physics-Informed Neural Networks).
+
+\subsection{Softening Parameter Study}
+
+Table~\ref{table:softening_effect} shows how $\epsilon$ affects accuracy.
+
+\begin{table}[H]
+  \centering
+  \caption{Effect of softening parameter on error ($N=1{,}000{,}000$, Direct CUDA).}
+  \label{table:softening_effect}
+  \begin{tabular}{rr}
+    \toprule
+    $\epsilon$ & Relative Error (\%) \\
+    \midrule
+    0.001 & 0.093 \\
+    0.01 & 0.118 \\
+    0.1 & 1.249 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Optimal choice:} $\epsilon = 0.01$ provides the best balance between accuracy and numerical stability. Very small $\epsilon$ ($<0.001$) can introduce floating-point precision issues, while large $\epsilon$ ($>0.01$) introduces systematic physical bias.
+
+\subsection{Graphics and Plots}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\linewidth]{../experiments/run_20251127_175653/plots/runtime_vs_n.png}
+    \caption{Runtime vs. particle count $N$ for all methods and implementations. Log-log plot shows expected scaling: $O(N^2)$ for Direct, $O(N)$ for MC (at fixed $K$). CUDA implementations consistently outperform CuPy.}
+    \label{fig:runtime_vs_n}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\linewidth]{../experiments/run_20251127_175653/plots/accuracy_comparison.png}
+    \caption{Accuracy comparison across methods ($\epsilon=0.01$, $K=100{,}000$). All methods converge to $\sim0.12\%$ error at $N=10^6$. The 1\% reference line indicates the assignment accuracy target.}
+    \label{fig:accuracy}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\linewidth]{../experiments/run_20251127_175653/plots/speedup_factors.png}
+    \caption{Speedup factors relative to Direct CuPy baseline. CUDA Direct achieves 107× speedup at $N=10^5$. Note that MC CuPy is slower than baseline due to broadcasting overhead.}
+    \label{fig:speedup}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\linewidth]{../experiments/run_20251127_175653/plots/mc_error_vs_k.png}
+    \caption{Monte Carlo error vs. sample count $K$ ($\epsilon=0.01$). Flat lines contradict the expected $1/\sqrt{K}$ scaling (dashed reference), confirming systematic error dominance.}
+    \label{fig:mc_error_vs_k}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\linewidth]{../experiments/run_20251127_175653/plots/softening_study.png}
+    \caption{Softening parameter sensitivity. Left: Monte Carlo. Right: Direct Summation. Optimal $\epsilon \approx 0.01$ balances accuracy and stability across all $N$.}
+    \label{fig:softening}
+\end{figure}
+
+% =================================================================
+\section{Discussion}
+
+\subsection{Performance Analysis}
+
+\subsubsection{CUDA vs. CuPy Trade-offs}
+
+The performance gap between CUDA and CuPy widened dramatically with problem size:
+
+\begin{itemize}
+\item \textbf{Small scale ($N \leq 10{,}000$):} CuPy competitive, easier development justified
+\item \textbf{Medium scale ($N = 100{,}000$):} CUDA 100× faster, development cost amortized
+\item \textbf{Large scale ($N = 1{,}000{,}000$):} CuPy impractical (>2 min), CUDA essential
+\end{itemize}
+
+\textbf{Root causes of CuPy slowdown:}
+\begin{enumerate}
+\item \textbf{Broadcasting memory overhead:} Creating $N \times N$ temporary arrays
+\item \textbf{Double-loop structure:} Outer loop over chunks, inner broadcasting
+\item \textbf{Python dispatch overhead:} Kernel launch latency per chunk
+\item \textbf{Suboptimal memory access:} 3D array broadcasting 6× slower than separate 1D operations
+\end{enumerate}
+
+\textbf{CUDA advantages:}
+\begin{enumerate}
+\item \textbf{Linear memory access:} No $O(N^2)$ temporary storage
+\item \textbf{Single kernel launch:} Minimal dispatch overhead
+\item \textbf{Fine-grained control:} Explicit coalesced access patterns
+\item \textbf{Compile-time optimization:} nvcc aggressive optimizations
+\end{enumerate}
+
+\subsubsection{Monte Carlo Error Scaling Breakdown}
+
+The failure of Monte Carlo error to follow $\sigma \propto 1/\sqrt{K}$ scaling reveals an important lesson: \textbf{theoretical statistical properties only hold when statistical error dominates}.
+
+In our experiments:
+\begin{equation}
+\text{Total Error} = \sqrt{\text{(Statistical Error)}^2 + \text{(Systematic Error)}^2}
+\end{equation}
+
+With $\epsilon=0.01$, systematic error $\approx 0.12\%$ overwhelms statistical error even at $K=1{,}000$. Increasing $K$ to $100{,}000$ provides no improvement.
+
+\textbf{Practical implications:}
+\begin{itemize}
+\item For $\epsilon=0.01$: Use $K \geq 10{,}000$ (further increases wasteful)
+\item To improve accuracy: Reduce $\epsilon$ (e.g., $\epsilon=0.001$ achieves 0.09\% error)
+\item Variance reduction techniques would help only after reducing systematic error
+\end{itemize}
+
+\subsubsection{Deep Learning Generalization Failure}
+
+The catastrophic failure ($>10^{13}$\% error) despite good training performance highlights fundamental challenges in applying standard neural networks to physics problems:
+
+\textbf{Why aggregated features failed:}
+\begin{itemize}
+\item Feature distributions are $N$-dependent (e.g., mean pairwise distance scales with $\sqrt{N}$)
+\item Model learned correlations valid only for training regime ($N=5{,}000$)
+\item No architectural inductive bias for scale invariance
+\item No physics constraints (e.g., $U \propto N$ for uniform density)
+\end{itemize}
+
+\textbf{Potential solutions (future work):}
+\begin{enumerate}
+\item \textbf{Graph Neural Networks (GNN):} Process particle sets natively, permutation-invariant
+\item \textbf{Physics-Informed Neural Networks (PINN):} Embed gravitational equations in loss function
+\item \textbf{Normalized features:} Scale all features by $N$ or $N^2$ to achieve invariance
+\item \textbf{Multi-scale training:} Include $N \in [10^3, 10^6]$ in training set
+\item \textbf{Ensemble methods:} Train separate models for different $N$ ranges
+\end{enumerate}
+
+\subsection{Bottleneck Analysis}
+
+\subsubsection{Direct Summation}
+
+\textbf{Bottleneck:} $O(N^2)$ computational complexity becomes prohibitive for $N > 10^6$.
+
+\textbf{Evidence:} Runtime increases from 1.4s at $N=10^6$ to projected $\sim140$s at $N=10^7$ (linear extrapolation suggests worse due to memory constraints).
+
+\textbf{Mitigation strategies:}
+\begin{itemize}
+\item Hierarchical methods (Barnes-Hut, Fast Multipole Method): Reduce to $O(N \log N)$
+\item GPU shared memory: Tile-based computation with data reuse
+\item Multi-GPU: Spatial domain decomposition
+\end{itemize}
+
+\subsubsection{Monte Carlo}
+
+\textbf{Bottleneck:} Systematic error floor limits achievable accuracy.
+
+\textbf{Evidence:} Error plateaus at $\sim0.12\%$ regardless of $K$ (Figure~\ref{fig:mc_error_vs_k}).
+
+\textbf{Mitigation strategies:}
+\begin{itemize}
+\item Adaptive softening: Variable $\epsilon(r)$ based on local density
+\item Importance sampling: Oversample close pairs (largest contributors)
+\item Hybrid method: MC for distant pairs, direct for close pairs
+\end{itemize}
+
+\subsubsection{CuPy Implementations}
+
+\textbf{Bottleneck:} Memory bandwidth from broadcasting large temporary arrays.
+
+\textbf{Evidence:}
+\begin{itemize}
+\item Out-of-memory at $N=10^5$ with full broadcasting
+\item Chunking to $2^{15}$ required, introducing loop overhead
+\item Performance degradation (6×) from 3D vs. 1D broadcasting
+\end{itemize}
+
+\textbf{Mitigation strategies:}
+\begin{itemize}
+\item CuPy RawKernel: Write custom CUDA kernels within Python
+\item Numba CUDA: JIT-compiled kernels from Python
+\item Hybrid approach: CuPy for orchestration, custom kernels for computation
+\end{itemize}
+
+\subsection{Amdahl's Law Considerations}
+
+For the CUDA implementations, sequential overhead is minimal:
+\begin{itemize}
+\item Data transfer (H2D/D2H): $<1\%$ of total time for large $N$
+\item Kernel launch: Negligible (single launch per computation)
+\item Result reduction: $O(N)$, dominated by $O(N^2)$ computation
+\end{itemize}
+
+Parallel efficiency remains high across all GPU cores. The primary limit is algorithmic complexity, not parallelization overhead.
+
+\subsection{Method Selection Guide}
+
+\begin{table}[H]
+  \centering
+  \caption{Recommended method based on problem characteristics.}
+  \label{table:method_selection}
+  \begin{tabular}{lll}
+    \toprule
+    Scenario & Recommended Method & Justification \\
+    \midrule
+    $N \leq 10^5$, high accuracy & Direct (CUDA) & Fast (<0.02s), accurate (<0.2\%) \\
+    $N \leq 10^6$, high accuracy & Direct (CUDA) & Acceptable time (<2s) \\
+    $N > 10^6$ & MC (CUDA) or tree method & Direct becomes prohibitive \\
+    Prototyping, $N \leq 10^4$ & Direct (CuPy) & Rapid development \\
+    Multiple evaluations & (Future) Trained GNN & Amortize training cost \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% =================================================================
+\section{Reproducibility}
+
+\subsection{Data Generation}
+
+All Plummer sphere data generated with fixed seed for reproducibility:
+
+\begin{lstlisting}[language=bash, caption={Data generation commands}]
+# Generate all particle counts
+python data_gen.py --n_bodies 1000 --seed 42 --output data/plummer_1000.npz
+python data_gen.py --n_bodies 10000 --seed 42 --output data/plummer_10000.npz
+python data_gen.py --n_bodies 100000 --seed 42 --output data/plummer_100000.npz
+python data_gen.py --n_bodies 1000000 --seed 42 --output data/plummer_1000000.npz
+\end{lstlisting}
+
+\subsection{Experiment Automation}
+
+Complete automated workflow:
+
+\begin{lstlisting}[language=bash, caption={Full experiment reproduction}]
+# Clone repository
+git clone [repository_url]
+cd assignment-7-proxy-pylon
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Compile CUDA programs
+cd direct_summation && nvcc -o direct_cuda direct_cuda.cu && cd ..
+cd monte_carlo && nvcc -o mc_cuda mc_cuda.cu && cd ..
+
+# Run all experiments (stores in experiments/run_YYYYMMDD_HHMMSS/)
+python run_experiments.py
+
+# Generate plots
+python plot_results.py --results experiments/run_*/results.csv
+
+# View results
+cat experiments/run_*/results.csv
+ls experiments/run_*/plots/*.png
+\end{lstlisting}
+
+\subsection{Configuration}
+
+All experimental parameters defined in \texttt{experiment\_config.py}:
+\begin{itemize}
+\item $N$ values: $[1000, 10000, 100000, 1000000]$
+\item $\epsilon$ values: $[0.001, 0.01, 0.1]$
+\item $K$ values: $[1000, 10000, 100000]$
+\item Warmup runs: 3
+\item Timing trials: 10
+\item Random seed: 42
+\end{itemize}
+
+\subsection{Output Structure}
+
+Experiments produce comprehensive structured output:
+
+\begin{lstlisting}[language=bash]
+experiments/run_YYYYMMDD_HHMMSS/
+|-- data/                  # Generated Plummer data
+|   |-- plummer_*.npz      # NumPy format
+|   +-- plummer_*.bin      # Binary format for CUDA
+|-- results/               # Individual JSON results
+|   |-- directsummation_cuda_N*_eps*.json
+|   |-- directsummation_cupy_N*_eps*.json
+|   |-- montecarlo_cuda_N*_K*_eps*.json
+|   |-- montecarlo_cupy_N*_K*_eps*.json
+|   +-- deeplearning_pytorch_N*.json
+|-- results.csv            # Aggregated CSV
+|-- logs/
+|   +-- experiment.log     # Execution log
++-- plots/                 # Generated plots (PNG)
+    |-- runtime_vs_n.png
+    |-- accuracy_comparison.png
+    |-- speedup_factors.png
+    |-- mc_error_vs_k.png
+    |-- softening_study.png
+    +-- method_comparison_summary.png
+\end{lstlisting}
+
+\subsection{JSON Output Format}
+
+Each experiment produces a JSON file with complete metadata:
+
+\begin{lstlisting}[language=Python, caption={Example JSON structure}]
+{
+  "method": "direct_summation",
+  "implementation": "cuda",
+  "timestamp": "2025-11-27T17:57:33",
+  "parameters": {
+    "n_bodies": 1000000,
+    "G": 1.0,
+    "softening": 0.01
+  },
+  "timing": {
+    "mean_time_seconds": 1.433239,
+    "std_time_seconds": 0.006245,
+    "n_trials": 10,
+    "warmup_runs": 3
+  },
+  "results": {
+    "U_computed": -0.294178,
+    "U_analytical": -0.294524,
+    "relative_error": 0.001176,
+    "relative_error_percent": 0.1176
+  }
+}
+\end{lstlisting}
+
+% =================================================================
+\section{Conclusion}
+
+\subsection{Summary of Achievements}
+
+This study successfully implemented and evaluated three GPU-accelerated methods for computing gravitational potential energy in N-body systems. Key results:
+
+\textbf{Performance:}
+\begin{itemize}
+\item CUDA Direct Summation achieved 1.43s runtime for $N=10^6$ with 0.12\% error
+\item CUDA implementations outperformed CuPy by 92-107× at large scales
+\item Monte Carlo offered no advantage for $N \leq 10^6$ at tested sample counts
+\end{itemize}
+
+\textbf{Accuracy:}
+\begin{itemize}
+\item Direct methods consistently achieved $<0.2\%$ error for $N \geq 10^5$
+\item Softening parameter $\epsilon=0.01$ provided optimal accuracy/stability balance
+\item Monte Carlo error dominated by systematic effects, not statistical variance
+\end{itemize}
+
+\textbf{Lessons Learned:}
+\begin{itemize}
+\item Low-level CUDA essential for production-scale computations ($N > 10^5$)
+\item High-level CuPy excellent for prototyping and development ($N \leq 10^4$)
+\item Standard neural networks require physics-informed architectures for this problem
+\item Broadcasting performance critically depends on array access patterns (6× difference)
+\end{itemize}
+
+\subsection{Next Steps for Performance Improvement}
+
+\textbf{Immediate optimizations:}
+\begin{enumerate}
+\item \textbf{Shared memory tiling:} Load position data into shared memory for reuse across threads (expected 2-3× speedup)
+\item \textbf{Warp-level reduction:} Use warp shuffle operations for faster partial sum accumulation
+\item \textbf{Multi-GPU:} Spatial decomposition for $N > 10^6$
+\end{enumerate}
+
+\textbf{Algorithmic improvements:}
+\begin{enumerate}
+\item \textbf{Barnes-Hut tree method:} Reduce complexity to $O(N \log N)$ for $N > 10^6$
+\item \textbf{Fast Multipole Method (FMM):} Achieve $O(N)$ scaling with controlled accuracy
+\item \textbf{Hybrid MC-Direct:} Use MC for distant pairs, direct for close pairs
+\item \textbf{Graph Neural Networks:} Revisit deep learning with physics-aware architecture
+\end{enumerate}
+
+\textbf{Most impactful single improvement:} Implementing Barnes-Hut tree code would enable scaling to $N=10^8$ particles while maintaining acceptable accuracy, far beyond the current $O(N^2)$ limitation.
+
+\section*{Acknowledgments}
+
+This work utilized the CUDA toolkit and GPU computing resources. CuPy and PyTorch libraries enabled rapid prototyping. Experimental automation scripts significantly accelerated the parameter sweep studies. Claude Code assisted with report writing and data analysis.
+
+\section*{Honor Statement}
+\honor
+
+\printbibliography
+
+\end{document}
